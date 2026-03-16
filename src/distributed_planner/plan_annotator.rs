@@ -189,21 +189,33 @@ fn _annotate_plan(
         // This is a leaf node, maybe a DataSourceExec, or maybe something else custom from the
         // user. We need to estimate how many tasks are needed for this leaf node, and we'll take
         // this decision into account when deciding how many tasks will be actually used.
-        return if let Some(estimate) = estimator.task_estimation(&plan, cfg) {
-            Ok(AnnotatedPlan {
-                plan_or_nb: PlanOrNetworkBoundary::Plan(plan),
-                children: Vec::new(),
-                task_count: estimate.task_count.limit(max_tasks),
-            })
+        let task_count = if let Some(estimate) = estimator.task_estimation(&plan, cfg) {
+            estimate.task_count.limit(max_tasks)
         } else {
-            // We could not determine how many tasks this leaf node should run on, so
-            // assume it cannot be distributed and use just 1 task.
-            Ok(AnnotatedPlan {
-                plan_or_nb: PlanOrNetworkBoundary::Plan(plan),
-                children: Vec::new(),
-                task_count: Maximum(1),
-            })
+            Maximum(1)
         };
+
+        let mut annotation = AnnotatedPlan {
+            plan_or_nb: PlanOrNetworkBoundary::Plan(plan.clone()),
+            children: Vec::new(),
+            task_count: task_count.clone(),
+        };
+
+        // For leaf nodes with task_count > 1 under a coalescing parent, we still
+        // want a network boundary — each worker independently scans local data.
+        if let Some(parent) = parent
+            && task_count.as_usize() > 1
+            && (parent.as_any().is::<CoalescePartitionsExec>()
+                || parent.as_any().is::<SortPreservingMergeExec>())
+        {
+            annotation = AnnotatedPlan {
+                plan_or_nb: PlanOrNetworkBoundary::Coalesce,
+                children: vec![annotation],
+                task_count,
+            };
+        }
+
+        return Ok(annotation);
     }
 
     let mut task_count = estimator
@@ -259,8 +271,6 @@ fn _annotate_plan(
             };
         }
     } else if let Some(parent) = parent
-        // If this node is a leaf node, putting a network boundary above is a bit wasteful, so
-        // we don't want to do it.
         && !plan.children().is_empty()
         // If the parent is trying to coalesce all partitions into one, we need to introduce
         // a network coalesce right below it (or in other words, above the current node)
