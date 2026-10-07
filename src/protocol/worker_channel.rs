@@ -131,11 +131,13 @@ pub struct WorkUnitMsg {
 }
 
 pub enum WorkerToCoordinatorMsg {
-    /// Sends the metrics collected during task execution back to the coordinator.
-    /// This is sent after all partitions of a task have finished (or been dropped),
-    /// ensuring metrics are never lost due to early stream termination.
-    /// metrics[i] is the set of metrics for plan node i in pre-order traversal order.
+    /// Final task metrics, sent when the coordinator closes the query's request stream.
+    /// Supersedes live updates, including snapshots captured when a task's outputs finish.
+    /// Metrics are in task-local preorder plan traversal order.
     TaskMetrics(TaskMetrics),
+    /// Sparse replacement snapshots from tasks on this worker belonging to the same query.
+    /// Sent on one query-scoped coordinator channel when periodic reporting is enabled.
+    MetricsUpdate(Vec<TaskMetricsUpdate>),
     /// Sends the final dynamic filters used by dynamic filter consumers back to the coorindator
     /// for displaying.
     TaskCompletedDynamicFilters(TaskCompletedDynamicFilters),
@@ -183,6 +185,13 @@ pub struct TaskMetrics {
     /// associated to a specific node, they are global to the task, like the time at which the plan
     /// was fed by the coordinator to the worker.
     pub task_metrics: MetricsSet,
+}
+
+/// A cumulative snapshot for one task, identified independently of its carrier channel.
+#[derive(Clone, Debug)]
+pub struct TaskMetricsUpdate {
+    pub task_key: TaskKey,
+    pub metrics: TaskMetrics,
 }
 
 #[derive(Default)]

@@ -42,10 +42,9 @@ message ApplyDynamicFilter {
 
 message WorkerToCoordinatorMsg {
   oneof inner {
-    // Sends the metrics collected during task execution back to the coordinator.
-    // This is sent after all partitions of a task have finished (or been dropped),
-    // ensuring metrics are never lost due to early stream termination.
-    // metrics[i] is the set of metrics for plan node i in pre-order traversal order.
+    // Final task metrics, sent when the coordinator closes the query's request stream.
+    // Supersedes live updates, including snapshots captured when a task's outputs finish.
+    // Metrics are in task-local preorder plan traversal order.
     TaskMetrics task_metrics = 1;
 
     // Load information reported by a task. This information is used for dynamically
@@ -70,6 +69,9 @@ message WorkerToCoordinatorMsg {
 
     // An observed dynamic filter state produced by this task.
     ProducedDynamicFilter produced_dynamic_filter = 5;
+
+    // Opt-in worker/query batch of cumulative task snapshots.
+    MetricsUpdate metrics_update = 6;
   }
 }
 
@@ -98,6 +100,15 @@ message TaskMetrics {
   // associated to a specific node, they are global to the task, like the time at which the plan
   // was fed by the coordinator to the worker.
   MetricsSet task_metrics = 2;
+}
+
+message MetricsUpdate {
+  repeated TaskMetricsUpdate tasks = 1;
+}
+
+message TaskMetricsUpdate {
+  TaskKey task_key = 1;
+  TaskMetrics metrics = 2;
 }
 
 // Load information reported for a specific partition with information about this

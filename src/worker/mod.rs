@@ -1,5 +1,6 @@
 mod impl_coordinator_channel;
 mod impl_execute_task;
+mod live_metrics;
 mod session_builder;
 mod single_write_multi_read;
 mod task_data;

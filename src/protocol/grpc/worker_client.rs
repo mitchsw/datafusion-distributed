@@ -2,7 +2,7 @@ use super::channel_resolver::BoxCloneSyncChannel;
 use super::errors::{map_flight_to_datafusion_error, map_status_to_datafusion_error};
 use super::generated::worker as pb;
 use super::metrics_proto::metrics_set_proto_to_df;
-use crate::common::{RetryOutcome, serialize_uuid};
+use crate::common::{RetryOutcome, deserialize_uuid, serialize_uuid};
 use crate::grpc::errors::tonic_status_to_datafusion_error;
 use crate::grpc::generated::worker::FlightAppMetadata;
 use crate::grpc::on_drop_stream::on_drop_stream;
@@ -12,7 +12,8 @@ use crate::{
     GetWorkerInfoResponse, LatencyMetricExt, LoadInfo, MaxLatencyMetric, MaybeEncoded,
     MinLatencyMetric, P50LatencyMetric, P95LatencyMetric, ProducedDynamicFilter, ProducerHead,
     SetPlanRequest, TaskCompletedDynamicFilters, TaskDynamicFilter, TaskKey, TaskMetrics,
-    WorkUnitBatch, WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
+    TaskMetricsUpdate, WorkUnitBatch, WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel,
+    WorkerToCoordinatorMsg,
 };
 use arrow_flight::FlightData;
 use arrow_flight::decode::FlightRecordBatchStream;
@@ -570,6 +571,15 @@ fn decode_worker_to_coordinator_msg(
             .inner
             .ok_or_else(|| missing("WorkerToCoordinatorMsg.inner"))?
         {
+            pb::worker_to_coordinator_msg::Inner::MetricsUpdate(batch) => {
+                WorkerToCoordinatorMsg::MetricsUpdate(
+                    batch
+                        .tasks
+                        .into_iter()
+                        .map(decode_metrics_update)
+                        .collect::<Result<_>>()?,
+                )
+            }
             pb::worker_to_coordinator_msg::Inner::TaskMetrics(task_metrics) => {
                 WorkerToCoordinatorMsg::TaskMetrics(decode_task_metrics(task_metrics)?)
             }
@@ -614,6 +624,24 @@ fn decode_task_completed_dynamic_filters(
                 expression: MaybeEncoded::Encoded(filter.expression_proto),
             })
             .collect(),
+    })
+}
+
+fn decode_metrics_update(update: pb::TaskMetricsUpdate) -> Result<TaskMetricsUpdate> {
+    let key = update
+        .task_key
+        .ok_or_else(|| missing("metrics_update.task_key"))?;
+    Ok(TaskMetricsUpdate {
+        task_key: TaskKey {
+            query_id: deserialize_uuid(&key.query_id)?,
+            stage_id: key.stage_id as usize,
+            task_number: key.task_number as usize,
+        },
+        metrics: decode_task_metrics(
+            update
+                .metrics
+                .ok_or_else(|| missing("metrics_update.metrics"))?,
+        )?,
     })
 }
 

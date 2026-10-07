@@ -1,4 +1,3 @@
-use crate::common::TreeNodeExt;
 use crate::dynamic_filtering::{
     discover_dynamic_filter_consumers, discover_dynamic_filter_producers,
 };
@@ -8,13 +7,13 @@ use crate::protocol::LocalWorkerContext;
 #[cfg(feature = "integration")]
 use crate::protocol::grpc::on_drop_stream;
 use crate::work_unit_feed::{RemoteWorkUnitFeedRegistry, set_work_unit_received_time};
+use crate::worker::live_metrics::{TaskMetricsSource, collect_task_metrics};
 use crate::worker::task_data::TaskDataMetrics;
 use crate::{
     CoordinatorToWorkerMsg, DistributedConfig, DistributedExt, DistributedTaskContext,
     MaybeEncoded, ProducedDynamicFilter, SetPlanRequest, TaskCompletedDynamicFilters, TaskData,
-    TaskDynamicFilter, TaskMetrics, Worker, WorkerQueryContext, WorkerToCoordinatorMsg,
+    TaskDynamicFilter, Worker, WorkerQueryContext, WorkerToCoordinatorMsg,
 };
-use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, HashSet, Result, exec_datafusion_err};
 use datafusion::execution::{SessionStateBuilder, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
@@ -27,7 +26,7 @@ use http::HeaderMap;
 #[cfg(feature = "integration")]
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::oneshot::Sender;
+use std::time::Duration;
 use tokio::sync::{oneshot, watch};
 
 /// Return value of the [Worker::coordinator_channel] method.
@@ -103,10 +102,29 @@ impl Worker {
             };
             let plan = WorkerPlanRewriteHandlers::handle(ev).await?.plan;
 
+            let final_plan = Arc::new(OnceLock::new());
+            let task_data_metrics = Arc::new(TaskDataMetrics::new(request.query_start_time_ns));
+            let live_config =
+                DistributedConfig::from_config_options(task_ctx.session_config().options())?;
+            let live_metrics = (collect_metrics
+                && live_config.collect_metrics
+                && live_config.metrics_reporting_interval_ms != 0)
+                .then(|| {
+                    Arc::new(TaskMetricsSource::new(
+                        Arc::clone(&final_plan),
+                        Arc::clone(&task_data_metrics),
+                        DistributedTaskContext {
+                            task_index: key.task_number,
+                            task_count: request.task_count,
+                        },
+                    ))
+                });
+
             // Initialize partition count to the number of partitions in the stage
             Ok::<_, DataFusionError>(TaskData {
                 base_plan: plan,
-                final_plan: Arc::new(OnceLock::new()),
+                final_plan,
+                live_metrics,
                 task_ctx,
                 metrics_tx: match collect_metrics {
                     true => Arc::new(std::sync::Mutex::new(Some(metrics_tx))),
@@ -116,7 +134,7 @@ impl Worker {
                     true => Arc::new(std::sync::Mutex::new(Some(dynamic_filters_tx))),
                     false => Arc::new(std::sync::Mutex::new(None)),
                 },
-                task_data_metrics: Arc::new(TaskDataMetrics::new(request.query_start_time_ns)),
+                task_data_metrics,
             })
         };
 
@@ -132,6 +150,22 @@ impl Worker {
             Arc::clone(&task_data.task_ctx),
         )?;
         let load_info_rxs = sampler_gate.take_receivers();
+
+        let (metrics_registration, live_metrics_stream) = match &task_data.live_metrics {
+            Some(source) => {
+                let interval = DistributedConfig::from_config_options(
+                    task_data.task_ctx.session_config().options(),
+                )?
+                .metrics_reporting_interval_ms;
+                let (registration, stream) = self.metrics_reporters.register(
+                    key,
+                    Arc::clone(source),
+                    Duration::from_millis(interval),
+                );
+                (Some(registration), stream)
+            }
+            None => (None, futures::stream::empty().boxed()),
+        };
 
         let dynamic_filter_remote_producer_ids: HashSet<_> = request
             .dynamic_filter_remote_producer_ids
@@ -161,6 +195,7 @@ impl Worker {
         //    channel, and then that channel is closed.
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
+            let _metrics_registration = metrics_registration;
             let mut stream = stream.map_ok(set_work_unit_received_time);
             while let Some(Ok(msg)) = stream.next().await {
                 match msg {
@@ -223,7 +258,7 @@ impl Worker {
                 let task_data_metrics = &task_data.task_data_metrics;
                 task_data_metrics.mark_execution_finished();
                 if let Some(metrics_tx) = metrics_tx {
-                    send_metrics_via_channel(metrics_tx, plan, d_ctx, task_data_metrics);
+                    let _ = metrics_tx.send(collect_task_metrics(plan, d_ctx, task_data_metrics));
                 }
                 if let Some(dynamic_filters_tx) = dynamic_filters_tx {
                     // TODO(#686): handle error
@@ -276,6 +311,7 @@ impl Worker {
             produced_dynamic_filters_stream.boxed(),
             load_info_stream.boxed(),
             metrics_stream.boxed(),
+            live_metrics_stream,
             dynamic_filters_stream.boxed(),
         ])
         .map(Ok)
@@ -356,25 +392,4 @@ fn build_task_completed_dynamic_filters(
         });
     }
     Ok(TaskCompletedDynamicFilters { filters })
-}
-
-/// Collects metrics from the plan in pre-order traversal order and sends them via the
-/// coordinator channel oneshot.
-fn send_metrics_via_channel(
-    metrics_tx: Sender<TaskMetrics>,
-    plan: &Arc<dyn ExecutionPlan>,
-    dt_ctx: DistributedTaskContext,
-    task_data_metrics: &Arc<TaskDataMetrics>,
-) {
-    let mut pre_order_plan_metrics = vec![];
-    let _ = plan.apply_with_dt_ctx(dt_ctx, |node, _| {
-        pre_order_plan_metrics.push(node.metrics().unwrap_or_default());
-        Ok(TreeNodeRecursion::Continue)
-    });
-
-    // Ignore send errors — the coordinator channel may have been dropped (e.g. query cancelled).
-    let _ = metrics_tx.send(TaskMetrics {
-        pre_order_plan_metrics,
-        task_metrics: task_data_metrics.to_metrics_set(),
-    });
 }

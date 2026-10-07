@@ -29,6 +29,9 @@ extensions_options! {
         /// Propagate collected metrics from all nodes in the plan across network boundaries
         /// so that they can be reconstructed on the head node of the plan.
         pub collect_metrics: bool, default = true
+        /// Interval in milliseconds for worker-batched live metrics. Zero disables periodic
+        /// reporting. Requires `collect_metrics` and support on both coordinator and workers.
+        pub metrics_reporting_interval_ms: u64, default = 0
         /// Collect completed dynamic filters from worker tasks so that they can be displayed in
         /// the distributed plan. This does not control whether dynamic filtering is used during
         /// query execution.

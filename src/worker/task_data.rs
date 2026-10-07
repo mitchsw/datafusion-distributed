@@ -1,5 +1,6 @@
 use crate::common::OnceLockResult;
 use crate::common::now_ns;
+use crate::worker::live_metrics::TaskMetricsSource;
 use crate::{MaxLatencyMetric, ProducerHead, TaskCompletedDynamicFilters, TaskMetrics};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
@@ -14,6 +15,7 @@ use tokio::sync::oneshot;
 /// TaskData stores state for a single task being executed by this Endpoint. It may be shared
 /// by concurrent requests for the same task which execute separate partitions.
 pub struct TaskData {
+    pub(super) live_metrics: Option<Arc<TaskMetricsSource>>,
     /// Task context suitable for execute different partitions from the same task.
     pub(crate) task_ctx: Arc<TaskContext>,
     pub(crate) base_plan: Arc<dyn ExecutionPlan>,
@@ -70,6 +72,9 @@ impl TaskDataMetrics {
     }
 
     pub(super) fn mark_execution_finished(&self) {
+        if self.plan_finished_at.value() != 0 {
+            return;
+        }
         self.plan_finished_at.add_duration(Duration::from_nanos(
             now_ns::<u64>().saturating_sub(self.query_start_time_ns as u64),
         ))

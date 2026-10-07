@@ -40,17 +40,16 @@ pub struct ApplyDynamicFilter {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WorkerToCoordinatorMsg {
-    #[prost(oneof = "worker_to_coordinator_msg::Inner", tags = "1, 2, 3, 4, 5")]
+    #[prost(oneof = "worker_to_coordinator_msg::Inner", tags = "1, 2, 3, 4, 5, 6")]
     pub inner: ::core::option::Option<worker_to_coordinator_msg::Inner>,
 }
 /// Nested message and enum types in `WorkerToCoordinatorMsg`.
 pub mod worker_to_coordinator_msg {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Inner {
-        /// Sends the metrics collected during task execution back to the coordinator.
-        /// This is sent after all partitions of a task have finished (or been dropped),
-        /// ensuring metrics are never lost due to early stream termination.
-        /// metrics\[i\] is the set of metrics for plan node i in pre-order traversal order.
+        /// Final task metrics, sent when the coordinator closes the query's request stream.
+        /// Supersedes live updates, including snapshots captured when a task's outputs finish.
+        /// Metrics are in task-local preorder plan traversal order.
         #[prost(message, tag = "1")]
         TaskMetrics(super::TaskMetrics),
         /// Load information reported by a task. This information is used for dynamically
@@ -76,6 +75,9 @@ pub mod worker_to_coordinator_msg {
         /// An observed dynamic filter state produced by this task.
         #[prost(message, tag = "5")]
         ProducedDynamicFilter(super::ProducedDynamicFilter),
+        /// Opt-in worker/query batch of cumulative task snapshots.
+        #[prost(message, tag = "6")]
+        MetricsUpdate(super::MetricsUpdate),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -111,6 +113,18 @@ pub struct TaskMetrics {
     /// was fed by the coordinator to the worker.
     #[prost(message, optional, tag = "2")]
     pub task_metrics: ::core::option::Option<MetricsSet>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MetricsUpdate {
+    #[prost(message, repeated, tag = "1")]
+    pub tasks: ::prost::alloc::vec::Vec<TaskMetricsUpdate>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TaskMetricsUpdate {
+    #[prost(message, optional, tag = "1")]
+    pub task_key: ::core::option::Option<TaskKey>,
+    #[prost(message, optional, tag = "2")]
+    pub metrics: ::core::option::Option<TaskMetrics>,
 }
 /// Load information reported for a specific partition with information about this
 /// amount of data flowing through the plan.

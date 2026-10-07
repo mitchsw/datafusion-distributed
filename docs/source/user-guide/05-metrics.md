@@ -5,7 +5,7 @@ etc.) live on each node and can be inspected after execution. In a distributed q
 runs on remote workers, so those metrics need to be gathered back to the coordinator before you can
 display them.
 
-Distributed DataFusion does this for you, and exposes two functions you can use to build your own
+Distributed DataFusion does this for you, and exposes functions you can use to build your own
 EXPLAIN ANALYZE in application code.
 
 ## Enabling collection
@@ -41,7 +41,8 @@ These functions, all exported from the crate root, do the work:
 - `display_plan_ascii(plan, show_metrics)` — renders the plan tree. Pass `true` to include the metrics
   attached to each node.
 
-The order of operations matters: **the plan must be fully executed before its metrics are available.**
+For a complete final view, drain the result stream before awaiting the final rewrites.
+For a live view, use the snapshot API described below.
 
 ```rust
 use datafusion::physical_plan::execute_stream;
@@ -92,3 +93,38 @@ runtime metrics, including network-level metrics on the boundaries:
 
 > If `plan` is not a distributed plan (its root is not a `DistributedExec`),
 > `rewrite_distributed_plan_with_metrics` returns it unchanged, so it is always safe to call.
+
+## Available metrics and live progress
+
+`snapshot_distributed_plan_with_metrics(plan, format)` reads currently available
+metrics without waiting for workers. It supports `Aggregated` and `PerTask`, omits
+missing reports, and returns a plan with frozen metric values plus `is_complete`.
+Call on the original executing `DistributedExec` root. Before full plan
+preparation it returns an error. A non-distributed root is returned unchanged.
+
+Subscribe with `DistributedExec::metrics_updates()` and read snapshots after
+notifications. Subscriptions work before execution, retain one pending change,
+and do not queue plans or make network requests. Continue consuming results and
+drop the subscription when they end. Collection disabled returns `None`.
+
+To receive reports during execution, set
+`SET distributed.metrics_reporting_interval_ms = 500` before planning. The default
+zero preserves terminal-only reporting; `collect_metrics=false` disables all
+reporting. Both ends must support the new live batch message.
+
+Each worker/query samples changed tasks and pushes batches of cumulative
+`TaskMetrics` snapshots over an existing control stream. Coordinator-local
+operators are sampled at the same interval and also notify on change. Consumers
+can rate-limit notifications without a separate polling loop. A task finishing
+between ticks retains its completion snapshot until the next batch.
+
+All stages report directly to the query coordinator. Each operator aggregates its
+tasks using the existing rewriter; adding output rows across every stage would
+count data repeatedly. Final reports replace live values. `is_complete` requires
+all expected final reports, not query success. A channel closing without a final
+report retains its available metrics and leaves the snapshot incomplete; disabled
+collection also reports incomplete. Terminal rewriting continues to use only
+terminal reports, so use snapshots after cancellation or failure.
+
+A complete notification-driven example and design rationale are in
+[the ADR](../../adr/0001-live-query-metrics.md#coordinator-example).

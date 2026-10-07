@@ -51,6 +51,10 @@ impl Worker {
             }
 
             let stream = plan.execute(partition, Arc::clone(&task_ctx))?;
+            let stream = match &task_data.live_metrics {
+                Some(source) => source.track(stream, partition),
+                None => stream,
+            };
             let stream_schema = plan.schema();
 
             streams.push(Box::pin(RecordBatchStreamAdapter::new(stream_schema, stream)) as _);

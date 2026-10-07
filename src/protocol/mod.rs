@@ -12,6 +12,6 @@ pub use in_process::LocalWorkerContext;
 pub use worker_channel::{
     ApplyDynamicFilter, CoordinatorToWorkerMsg, ExecuteTaskRequest, GetWorkerInfoRequest,
     GetWorkerInfoResponse, LoadInfo, ProducedDynamicFilter, SetPlanRequest,
-    TaskCompletedDynamicFilters, TaskDynamicFilter, TaskKey, TaskMetrics, WorkUnitBatch,
-    WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
+    TaskCompletedDynamicFilters, TaskDynamicFilter, TaskKey, TaskMetrics, TaskMetricsUpdate,
+    WorkUnitBatch, WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
 };

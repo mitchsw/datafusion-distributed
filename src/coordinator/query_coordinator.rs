@@ -4,6 +4,7 @@ use crate::config_extension_ext::get_config_extension_propagation_headers;
 use crate::coordinator::DynamicFilterRegistry;
 use crate::coordinator::Store;
 use crate::coordinator::latency_metric::LatencyMetric;
+use crate::coordinator::metrics_store::MetricsStore;
 use crate::coordinator::spawner::Spawner;
 use crate::dynamic_filtering::{
     dynamic_filter_remote_producer_ids, is_local_dynamic_filtering_enabled,
@@ -58,7 +59,7 @@ pub(super) struct QueryCoordinator {
     task_ctx: Arc<TaskContext>,
     metrics: ExecutionPlanMetricsSet,
     coordinator_to_worker_metrics: CoordinatorToWorkerMetrics,
-    metrics_store: Option<Arc<Store<TaskMetrics>>>,
+    metrics_store: Option<Arc<MetricsStore>>,
     completed_dynamic_filter_store: Option<Arc<Store<TaskCompletedDynamicFilters>>>,
     dynamic_filter_registry: Arc<DynamicFilterRegistry>,
     pub(super) spawner: Spawner,
@@ -69,7 +70,7 @@ impl QueryCoordinator {
     pub(super) fn new(
         task_ctx: Arc<TaskContext>,
         metrics_set: &ExecutionPlanMetricsSet,
-        metrics_store: Option<Arc<Store<TaskMetrics>>>,
+        metrics_store: Option<Arc<MetricsStore>>,
         completed_dynamic_filter_store: Option<Arc<Store<TaskCompletedDynamicFilters>>>,
         output: &mut RecordBatchReceiverStreamBuilder,
     ) -> Self {
@@ -128,7 +129,7 @@ pub(super) struct StageCoordinator<'a> {
     task_ctx: &'a Arc<TaskContext>,
     metrics_set: &'a ExecutionPlanMetricsSet,
     metrics: &'a CoordinatorToWorkerMetrics,
-    metrics_store: &'a Option<Arc<Store<TaskMetrics>>>,
+    metrics_store: &'a Option<Arc<MetricsStore>>,
     completed_dynamic_filter_store: &'a Option<Arc<Store<TaskCompletedDynamicFilters>>>,
     dynamic_filter_registry: &'a Arc<DynamicFilterRegistry>,
     spawner: &'a Spawner,
@@ -290,6 +291,7 @@ impl<'a> StageCoordinator<'a> {
             task_number: task_i,
         };
         let mut task_metrics = self.metrics_store.clone();
+        let live_metrics = self.metrics_store.clone();
         let mut completed_dynamic_filter_store = self.completed_dynamic_filter_store.clone();
         let dynamic_filter_registry = Arc::clone(self.dynamic_filter_registry);
         let task_ctx = Arc::clone(self.task_ctx);
@@ -302,6 +304,12 @@ impl<'a> StageCoordinator<'a> {
         self.spawner.spawn(async move {
             while let Some(msg) = worker_to_coordinator_stream.try_next().await? {
                 let receiver_closed = match msg {
+                    WorkerToCoordinatorMsg::MetricsUpdate(updates) => {
+                        if let Some(store) = &live_metrics {
+                            store.update(task_key.query_id, updates)?;
+                        }
+                        false
+                    }
                     WorkerToCoordinatorMsg::TaskMetrics(metrics) => {
                         reports_tx.send(FinalReport::Metrics(metrics)).is_err()
                     }
@@ -362,9 +370,10 @@ impl<'a> StageCoordinator<'a> {
                     }
                 }
             }
-            // An unexecuted task sends no final reports; still complete its waits.
+            // Unexecuted or cancelled tasks can close without final reports. Retain any live
+            // metrics while still allowing terminal waits to finish.
             if let Some(store) = task_metrics {
-                store.insert(task_key, TaskMetrics::default());
+                store.close(task_key);
             }
             if let Some(store) = completed_dynamic_filter_store {
                 store.insert(task_key, TaskCompletedDynamicFilters::default());

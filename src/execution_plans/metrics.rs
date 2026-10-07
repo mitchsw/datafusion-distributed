@@ -1,3 +1,5 @@
+use crate::metrics::DISTRIBUTED_DATAFUSION_TASK_ID_LABEL;
+use crate::metrics::snapshot::snapshot_metrics;
 use datafusion::physical_plan::metrics::MetricsSet;
 use std::sync::Arc;
 
@@ -18,11 +20,43 @@ pub(crate) struct MetricsWrapperExec {
     inner: Arc<dyn ExecutionPlan>,
     /// metrics for this plan node.
     metrics: MetricsSet,
+    include_inner_metrics: bool,
 }
 
 impl MetricsWrapperExec {
     pub(crate) fn new(inner: Arc<dyn ExecutionPlan>, metrics: MetricsSet) -> Self {
-        Self { inner, metrics }
+        Self {
+            inner,
+            metrics,
+            include_inner_metrics: true,
+        }
+    }
+
+    /// Freeze both reported and coordinator-local metrics. A reported metric supersedes a
+    /// local handle with the same identity, even if that handle has advanced since sampling.
+    pub(crate) fn snapshot(inner: Arc<dyn ExecutionPlan>, metrics: MetricsSet) -> Self {
+        let mut frozen = snapshot_metrics(&metrics);
+        for local in snapshot_metrics(&inner.metrics().unwrap_or_default()) {
+            if !metrics.iter().any(|reported| {
+                reported.value().name() == local.value().name()
+                    && reported.partition() == local.partition()
+                    && reported
+                        .labels()
+                        .iter()
+                        .filter(|l| l.name() != DISTRIBUTED_DATAFUSION_TASK_ID_LABEL)
+                        .eq(local
+                            .labels()
+                            .iter()
+                            .filter(|l| l.name() != DISTRIBUTED_DATAFUSION_TASK_ID_LABEL))
+            }) {
+                frozen.push(local);
+            }
+        }
+        Self {
+            inner,
+            metrics: frozen,
+            include_inner_metrics: false,
+        }
     }
 
     #[cfg(test)]
@@ -74,6 +108,7 @@ impl ExecutionPlan for MetricsWrapperExec {
                 ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
             )?,
             metrics: self.metrics.clone(),
+            include_inner_metrics: self.include_inner_metrics,
         }))
     }
 
@@ -88,6 +123,9 @@ impl ExecutionPlan for MetricsWrapperExec {
     /// returns the wrapped metrics merged with any other present in
     /// the inner [ExecutionPlan].
     fn metrics(&self) -> Option<MetricsSet> {
+        if !self.include_inner_metrics {
+            return Some(self.metrics.clone());
+        }
         match self.inner.metrics() {
             None => Some(self.metrics.clone()),
             Some(local_metrics) => {
@@ -119,5 +157,34 @@ impl ExecutionPlan for MetricsWrapperExec {
 
     fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
         Some(self.inner.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::Schema;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::metrics::{Count, Metric, MetricValue};
+
+    #[test]
+    fn snapshot_does_not_merge_newer_values_from_live_local_handles() {
+        let count = Count::new();
+        count.add(5);
+        let mut metrics = MetricsSet::new();
+        metrics.push(Arc::new(Metric::new(
+            MetricValue::OutputRows(count.clone()),
+            Some(0),
+        )));
+        let reported = snapshot_metrics(&metrics);
+        let local: Arc<dyn ExecutionPlan> = Arc::new(MetricsWrapperExec::new(
+            Arc::new(EmptyExec::new(Arc::new(Schema::empty()))),
+            metrics,
+        ));
+        count.add(10);
+        let snapshot = MetricsWrapperExec::snapshot(local, reported);
+        assert_eq!(snapshot.metrics().unwrap().output_rows(), Some(5));
+        count.add(20);
+        assert_eq!(snapshot.metrics().unwrap().output_rows(), Some(5));
     }
 }

@@ -3,13 +3,13 @@ use super::generated::worker as pb;
 use super::metrics_proto::df_metrics_set_to_proto;
 use super::spawn_select_all::spawn_select_all;
 
-use crate::common::{deserialize_uuid, now_ns};
+use crate::common::{deserialize_uuid, now_ns, serialize_uuid};
 use crate::protocol::grpc::{ObservabilityServiceImpl, ObservabilityServiceServer};
 use crate::{
     ApplyDynamicFilter, CoordinatorToWorkerMsg, DistributedConfig, ExecuteTaskRequest, LoadInfo,
     MaybeEncoded, ProducedDynamicFilter, ProducerHead, SetPlanRequest, TaskCompletedDynamicFilters,
-    TaskKey, TaskMetrics, WorkUnitBatch, WorkUnitFeedDeclaration, WorkUnitMsg, Worker,
-    WorkerResolver, WorkerToCoordinatorMsg,
+    TaskKey, TaskMetrics, TaskMetricsUpdate, WorkUnitBatch, WorkUnitFeedDeclaration, WorkUnitMsg,
+    Worker, WorkerResolver, WorkerToCoordinatorMsg,
 };
 
 use crate::worker::CoordinatorChannelResult;
@@ -276,6 +276,14 @@ fn encode_worker_to_coordinator_msg(
 ) -> Result<pb::WorkerToCoordinatorMsg, Status> {
     Ok(pb::WorkerToCoordinatorMsg {
         inner: Some(match msg {
+            WorkerToCoordinatorMsg::MetricsUpdate(tasks) => {
+                pb::worker_to_coordinator_msg::Inner::MetricsUpdate(pb::MetricsUpdate {
+                    tasks: tasks
+                        .into_iter()
+                        .map(encode_metrics_update)
+                        .collect::<Result<_, _>>()?,
+                })
+            }
             WorkerToCoordinatorMsg::TaskMetrics(task_metrics) => {
                 pb::worker_to_coordinator_msg::Inner::TaskMetrics(encode_task_metrics(
                     task_metrics,
@@ -332,6 +340,17 @@ fn encode_task_completed_dynamic_filters(
                 })
             })
             .collect::<Result<_, Status>>()?,
+    })
+}
+
+fn encode_metrics_update(update: TaskMetricsUpdate) -> Result<pb::TaskMetricsUpdate, Status> {
+    Ok(pb::TaskMetricsUpdate {
+        task_key: Some(pb::TaskKey {
+            query_id: serialize_uuid(&update.task_key.query_id),
+            stage_id: update.task_key.stage_id as u64,
+            task_number: update.task_key.task_number as u64,
+        }),
+        metrics: Some(encode_task_metrics(update.metrics)?),
     })
 }
 

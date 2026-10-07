@@ -38,9 +38,10 @@ pub use execution_plans::{
 };
 pub use metrics::{
     AvgLatencyMetric, BytesCounterMetric, BytesMetricExt, DISTRIBUTED_DATAFUSION_TASK_ID_LABEL,
-    DistributedMetricsFormat, FirstLatencyMetric, GaugeMetricExt, LatencyMetricExt, MaxGaugeMetric,
-    MaxLatencyMetric, MinLatencyMetric, P50LatencyMetric, P75LatencyMetric, P95LatencyMetric,
-    P99LatencyMetric, rewrite_distributed_plan_with_metrics,
+    DistributedMetricsFormat, DistributedMetricsSnapshot, FirstLatencyMetric, GaugeMetricExt,
+    LatencyMetricExt, MaxGaugeMetric, MaxLatencyMetric, MinLatencyMetric, P50LatencyMetric,
+    P75LatencyMetric, P95LatencyMetric, P99LatencyMetric, rewrite_distributed_plan_with_metrics,
+    snapshot_distributed_plan_with_metrics,
 };
 pub use protocol::LocalWorkerContext;
 
@@ -58,8 +59,8 @@ pub use worker_resolver::{WorkerResolver, get_distributed_worker_resolver};
 pub use protocol::{
     ApplyDynamicFilter, ChannelResolver, CoordinatorToWorkerMsg, ExecuteTaskRequest,
     GetWorkerInfoRequest, GetWorkerInfoResponse, LoadInfo, ProducedDynamicFilter, SetPlanRequest,
-    TaskCompletedDynamicFilters, TaskDynamicFilter, TaskKey, TaskMetrics, WorkUnitBatch,
-    WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
+    TaskCompletedDynamicFilters, TaskDynamicFilter, TaskKey, TaskMetrics, TaskMetricsUpdate,
+    WorkUnitBatch, WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
     get_distributed_channel_resolver,
 };
 pub use stage::{

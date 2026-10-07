@@ -1,4 +1,5 @@
 use crate::common::require_one_child;
+use crate::coordinator::metrics_store::MetricsStore;
 use crate::coordinator::prepare_dynamic_plan::prepare_dynamic_plan;
 use crate::coordinator::prepare_static_plan::prepare_static_plan;
 use crate::coordinator::query_coordinator::QueryCoordinator;
@@ -6,6 +7,8 @@ use crate::coordinator::store::{Store, task_keys_for_plan};
 use crate::dynamic_filtering::{
     is_local_dynamic_filtering_enabled, sever_dynamic_filter_relationships_in_plan_for_display,
 };
+use crate::metrics::collect_plan_metrics;
+use crate::metrics::snapshot::{metrics_equal, snapshot_metrics};
 use crate::{DistributedConfig, TaskCompletedDynamicFilters, TaskKey, TaskMetrics};
 use datafusion::common::internal_datafusion_err;
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -17,8 +20,11 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use std::fmt::Formatter;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
 /// [ExecutionPlan] that executes the inner plan in distributed mode.
 /// Before executing it, two modifications are lazily performed on the plan:
@@ -47,7 +53,7 @@ pub struct DistributedExec {
     metrics: ExecutionPlanMetricsSet,
     /// Storage where metrics collected from workers at runtime will place their results as they
     /// finish their respective remote tasks.
-    pub(crate) metrics_store: Option<Arc<Store<TaskMetrics>>>,
+    pub(crate) metrics_store: Option<Arc<MetricsStore>>,
     /// Storage for the completed dynamic filters reported by each worker task.
     pub(crate) completed_dynamic_filter_store: Option<Arc<Store<TaskCompletedDynamicFilters>>>,
 }
@@ -74,7 +80,7 @@ impl DistributedExec {
     /// Enables task metrics collection from remote workers.
     pub fn with_metrics_collection(mut self, enabled: bool) -> Self {
         self.metrics_store = match enabled {
-            true => Some(Arc::new(Store::new())),
+            true => Some(Arc::new(MetricsStore::new())),
             false => None,
         };
         self
@@ -87,6 +93,19 @@ impl DistributedExec {
             false => None,
         };
         self
+    }
+
+    /// Subscribe to coalesced metrics-change notifications. Returns `None` when collection
+    /// is disabled. Subscribe on the original plan, before or during execution, then call
+    /// [`crate::snapshot_distributed_plan_with_metrics`] after each notification.
+    ///
+    /// Emits an initial notification, then covers preparation, received reports, closure, and changes to
+    /// local coordinator metrics. Local sampling uses the query's reporting interval;
+    /// interval zero leaves only report/lifecycle notifications. Slow consumers retain one
+    /// notification, not a queue of plans. This stream does not drive query execution and
+    /// remains open while the plan's metrics store exists; drop it when results end.
+    pub fn metrics_updates(&self) -> Option<BoxStream<'static, ()>> {
+        Some(self.metrics_store.as_ref()?.updates())
     }
 
     /// Waits until all worker tasks have reported their metrics back via the coordinator channel
@@ -144,12 +163,20 @@ impl DistributedExec {
         &self,
         plan_for_viz: Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_plan_for_viz_and_metrics(plan_for_viz, self.metrics.clone())
+    }
+
+    pub(crate) fn with_plan_for_viz_and_metrics(
+        &self,
+        plan_for_viz: Arc<dyn ExecutionPlan>,
+        metrics: ExecutionPlanMetricsSet,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut prepared_plan = self.prepared_plan()?;
         prepared_plan.plan_for_viz = plan_for_viz;
         Ok(Arc::new(Self {
             base_plan: Arc::clone(&self.base_plan),
             prepared_plan: Arc::new(OnceLock::from(prepared_plan)),
-            metrics: self.metrics.clone(),
+            metrics,
             metrics_store: self.metrics_store.clone(),
             completed_dynamic_filter_store: self.completed_dynamic_filter_store.clone(),
         }))
@@ -221,6 +248,7 @@ impl ExecutionPlan for DistributedExec {
         let base_plan = Arc::clone(&self.base_plan);
         let prepared_plan = Arc::clone(&self.prepared_plan);
         let collect_dynamic_filters = self.completed_dynamic_filter_store.is_some();
+        let metrics_store = self.metrics_store.clone();
 
         let mut builder = RecordBatchReceiverStreamBuilder::new(self.schema(), 1);
         let tx = builder.tx();
@@ -265,6 +293,20 @@ impl ExecutionPlan for DistributedExec {
             prepared_plan.set(prepared).map_err(|_| {
                 internal_datafusion_err!("DistributedExec was already prepared for execution")
             })?;
+            if let Some(store) = metrics_store {
+                store.notify();
+                if d_cfg.metrics_reporting_interval_ms > 0 {
+                    let plan = Arc::clone(&head_stage);
+                    let interval = Duration::from_millis(d_cfg.metrics_reporting_interval_ms);
+                    let finished = query_coordinator.spawner.query_finished();
+                    query_coordinator.spawner.spawn(async move {
+                        tokio::select! {
+                            _ = finished.cancelled() => Ok(()),
+                            result = report_local_metrics(plan, store, interval) => result,
+                        }
+                    });
+                }
+            }
             let mut stream = head_stage.execute(partition, context)?;
             while let Some(msg) = stream.next().await {
                 if tx.send(Ok(msg?)).await.is_err() {
@@ -279,5 +321,123 @@ impl ExecutionPlan for DistributedExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
+    }
+}
+
+async fn report_local_metrics(
+    plan: Arc<dyn ExecutionPlan>,
+    store: Arc<MetricsStore>,
+    interval: Duration,
+) -> Result<()> {
+    let mut ticker = interval_at(Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut previous = Vec::new();
+    loop {
+        ticker.tick().await;
+        let current = collect_plan_metrics(&plan)?
+            .iter()
+            .map(snapshot_metrics)
+            .collect::<Vec<_>>();
+        if current.len() != previous.len()
+            || current
+                .iter()
+                .zip(&previous)
+                .any(|(a, b)| !metrics_equal(a, b))
+        {
+            previous = current;
+            store.notify();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DistributedExt;
+    use crate::test_utils::mock_exec::MockExec;
+    use crate::{DistributedMetricsFormat, snapshot_distributed_plan_with_metrics};
+    use datafusion::arrow::datatypes::Schema;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::physical_expr::projection::ProjectionExpr;
+    use datafusion::physical_plan::execute_stream;
+    use datafusion::physical_plan::metrics::MetricValue;
+    use datafusion::physical_plan::projection::ProjectionExec;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use futures::TryStreamExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn local_metrics_notify_without_remote_reports_and_stop_at_query_end() -> Result<()> {
+        let schema = Arc::new(Schema::empty());
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(Notify::new());
+        let source = MockExec::new(
+            vec![Ok(RecordBatch::new_empty(Arc::clone(&schema)))],
+            schema,
+        )
+        .with_use_task(false)
+        .with_gate(Arc::clone(&open), Arc::clone(&gate));
+        let source: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+            Vec::<ProjectionExpr>::new(),
+            Arc::new(source),
+        )?);
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(DistributedExec::new(Arc::clone(&source)).with_metrics_collection(true));
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_distributed_option_extension(DistributedConfig {
+                dynamic_task_count: false,
+                metrics_reporting_interval_ms: 10,
+                ..Default::default()
+            }),
+        );
+        let mut updates = plan
+            .downcast_ref::<DistributedExec>()
+            .unwrap()
+            .metrics_updates()
+            .unwrap();
+        assert_eq!(updates.next().await, Some(()));
+        let mut results = execute_stream(Arc::clone(&plan), ctx.task_ctx())?;
+        tokio::select! {
+            result = results.next() => panic!("gated query returned: {result:?}"),
+            notification = timeout(Duration::from_secs(2), updates.next()) => {
+                assert_eq!(notification.unwrap(), Some(()));
+            },
+        }
+        let rows = source
+            .metrics()
+            .unwrap()
+            .iter()
+            .find_map(|metric| match metric.value() {
+                MetricValue::OutputRows(rows) => Some(rows.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let format = DistributedMetricsFormat::Aggregated;
+        let first = snapshot_distributed_plan_with_metrics(Arc::clone(&plan), format)?;
+        rows.add(7);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                updates.next().await.unwrap();
+                let snapshot =
+                    snapshot_distributed_plan_with_metrics(Arc::clone(&plan), format).unwrap();
+                if snapshot.plan.children()[0].metrics().unwrap().output_rows() == Some(7) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            first.plan.children()[0].metrics().unwrap().output_rows(),
+            Some(0)
+        );
+        open.store(true, Ordering::SeqCst);
+        gate.notify_waiters();
+        timeout(Duration::from_secs(2), results.try_collect::<Vec<_>>())
+            .await
+            .unwrap()?;
+        Ok(())
     }
 }

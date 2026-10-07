@@ -1,4 +1,5 @@
 use crate::protocol::LocalWorkerContext;
+use crate::worker::live_metrics::WorkerMetrics;
 use crate::worker::{SingleWriteMultiRead, WorkerSessionBuilder};
 use crate::{DefaultSessionBuilder, TaskData, TaskKey};
 use datafusion::common::DataFusionError;
@@ -18,6 +19,7 @@ pub(crate) type TaskDataEntries = Cache<TaskKey, Arc<SingleWriteMultiRead<Result
 
 #[derive(Clone)]
 pub struct Worker {
+    pub(super) metrics_reporters: Arc<WorkerMetrics>,
     pub(super) runtime: Arc<RuntimeEnv>,
     /// TTL-based cache for task execution data. Entries are automatically evicted after
     /// TASK_CACHE_TTI seconds. This prevents memory leaks from abandoned or incomplete queries
@@ -35,6 +37,7 @@ impl Default for Worker {
         let cache = Cache::builder().time_to_idle(TASK_CACHE_TTI).build();
         Self {
             runtime: Arc::new(RuntimeEnv::default()),
+            metrics_reporters: Arc::default(),
             task_data_entries: Arc::new(cache),
             session_builder: Arc::new(DefaultSessionBuilder),
             max_message_size: Some(usize::MAX),
